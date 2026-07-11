@@ -1,0 +1,250 @@
+local transport="$1"
+if [[ ! "$transport" =~ mux$ ]]; then
+return
+fi
+colorize blue "━━━ Mux Configuration ━━━" bold
+prompt_with_default "Mux Version [1 or 2]" "2" CONFIG[mux_version]
+prompt_with_default "Mux Concurrency" "8" CONFIG[mux_concurrency]
+CONFIG[mux_framesize]="32768"
+CONFIG[mux_recievebuffer]="4194304"
+CONFIG[mux_streambuffer]="2097152"
+echo ""
+}
+prompt_tun_section() {
+local transport="$1"
+local mode="$2"
+local is_ipx="$3"
+[[ "$transport" != "tun" ]] && return
+colorize blue "━━━ TUN Configuration ━━━" bold
+prompt_with_default "TUN Device Name" "backhaul" CONFIG[tun_name]
+local default_local default_remote
+if [[ "$mode" == "server" ]]; then
+default_local="10.10.10.1/24"
+default_remote="10.10.10.2/24"
+else
+default_local="10.10.10.2/24"
+default_remote="10.10.10.1/24"
+fi
+while true; do
+prompt_with_default "TUN Local Address (CIDR)" "$default_local" CONFIG[tun_local_addr]
+if validate_cidr "${CONFIG[tun_local_addr]}"; then
+break
+fi
+local suggested=$(validate_cidr "${CONFIG[tun_local_addr]}" 2>&1)
+colorize red "Invalid CIDR. Network address should be: $suggested"
+done
+while true; do
+prompt_with_default "TUN Remote Address (CIDR)" "$default_remote" CONFIG[tun_remote_addr]
+if validate_cidr "${CONFIG[tun_remote_addr]}"; then
+break
+fi
+colorize red "Invalid CIDR format."
+done
+prompt_with_default "Health Port" "1234" CONFIG[tun_health_port]
+if [[ "$is_ipx" == "true" ]]; then
+prompt_with_default "MTU" "1320" CONFIG[tun_mtu]
+else
+prompt_with_default "MTU" "1500" CONFIG[tun_mtu]
+fi
+echo ""
+}
+prompt_tls_section() {
+local mode="$1"
+local transport="$2"
+if [[ ! "$transport" =~ ^(anytls|wss|wssmux|grpcs|grpcsmux|xgrpcsmux|https|httpsmux|xhttpsmux)$ ]]; then
+return
+fi
+colorize blue "━━━ TLS Configuration ━━━" bold
+if [[ "$mode" == "client" ]]; then
+local default_sni="${CONFIG[remote_addr]%%:*}"
+prompt_with_default "TLS Server Name (SNI)" "$default_sni" CONFIG[tls_sni]
+echo
+return
+fi
+if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
+colorize red "[*] TLS certificate or key missing, generating self-signed Ed25519 cert..."
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 -days 365 -sha256 -keyout "$KEY_FILE" -out  "$CERT_FILE" -subj "/CN=backhaul.com"
+colorize green "[*] Generated $CERT_FILE and $KEY_FILE"
+echo
+fi
+prompt_with_default "TLS Certificate Path" "$CERT_FILE" CONFIG[tls_cert]
+prompt_with_default "TLS Key Path" "$KEY_FILE" CONFIG[tls_key]
+echo ""
+}
+prompt_tuning_section() {
+local is_ipx="$1"
+local is_tun="$2"
+colorize blue "━━━ Tuning Configuration ━━━" bold
+prompt_boolean "Enable Auto Tuning" "true" CONFIG[auto_tuning]
+echo
+colorize magenta "Profiles: balanced, fast, latency, resource" normal
+prompt_with_default "Kernel Tuning Profile" "balanced" CONFIG[tuning_profile]
+prompt_with_default "Workers (0 = auto)" "0" CONFIG[workers]
+if [[ "$is_tun" != "true" ]]; then
+prompt_with_default "Channel Size" "4096" CONFIG[channel_size]
+fi
+if [[ "$is_tun" == "true" ]]; then
+CONFIG[channel_size]="10_000"
+fi
+if [[ "$is_ipx" == "true" ]]; then
+prompt_with_default "Batch Size" "2048" CONFIG[batch_size]
+prompt_with_default "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf]
+else
+prompt_with_default "TCP MSS (0 = auto)" "0" CONFIG[tcp_mss]
+prompt_with_default "SO_RCVBUF (0 = auto)" "0" CONFIG[so_rcvbuf]
+prompt_with_default "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf]
+fi
+if [[ "$is_tun" != "true" ]] && [[ "$is_ipx" != "true" ]]; then
+echo
+colorize magenta "Buffer Profiles: extreme_low_cpu, ultra_low_cpu, low_cpu, balanced, low_memory" normal
+prompt_with_default "Buffer Profile" "balanced" CONFIG[buffer_profile]
+prompt_with_default "Read Timeout" "120" CONFIG[read_timeout]
+fi
+echo ""
+}
+prompt_logging_section() {
+colorize blue "━━━ Logging Configuration ━━━" bold
+colorize magenta "Levels: panic, fatal, error, warn, info, debug, trace"
+prompt_with_default "Log Level" "info" CONFIG[log_level]
+echo ""
+}
+prompt_accept_udp_section() {
+local accept_udp="$1"
+[[ "$accept_udp" != "true" ]] && return
+CONFIG[ring_size]="64"
+CONFIG[frame_size]="2048"
+CONFIG[peer_idle_timeout_s]="120"
+CONFIG[write_timeout_ms]="3"
+}
+prompt_ports_section() {
+local mode="$1"
+local is_tun="$2"
+[[ "$mode" != "server" ]] && return
+if [[ "$is_tun" != "true" ]]; then
+colorize blue "━━━ Port Mapping Configuration ━━━" bold
+colorize green "Supported formats:"
+echo "  1. 443           - Listen on 443, forward to 443"
+echo "  2. 443=5000      - Listen on 443, forward to 5000"
+echo "  3. 443-600       - Listen on range 443-600"
+echo "  4. 443-600:5201  - Range forwarding to 5201"
+echo ""
+echo -ne "Enter port mappings (comma-separated): "
+read -r CONFIG[ports_mapping]
+echo ""
+else
+colorize blue "━━━ Port Mapping Configuration (tun helper) ━━━" bold
+colorize magenta "Forwarder: use 'bbackhaul' for TCP support only, or 'iptables' for TCP + UDP support"
+prompt_with_default "Forwarder (backhaul/iptables)" "backhaul" CONFIG[forwarder]
+echo ""
+colorize green "Supported formats:"
+echo "  1. 443           - Listen on 443, forward to 443"
+echo "  2. 443=5000      - Listen on 443, forward to 5000"
+echo ""
+echo -ne "Enter port mappings (comma-separated): "
+read -r CONFIG[ports_mapping]
+echo ""
+fi
+}
+prompt_ipx_section() {
+local is_ipx="$1"
+local mode="$2"
+[[ "$is_ipx" != "true" ]] && return
+colorize blue "━━━ IPX Configuration ━━━" bold
+CONFIG[ipx_mode]="$mode"
+AVAILABLE_PROFILES=("icmp" "ipip" "udp" "tcp" "gre" "bip")
+colorize magenta "Available profiles: ${AVAILABLE_PROFILES[*]}"
+while true; do
+prompt_with_default "Profile" "tcp" CONFIG[ipx_profile]
+CONFIG[ipx_profile]="${CONFIG[ipx_profile],,}"
+for profile in "${AVAILABLE_PROFILES[@]}"; do
+if [[ "${CONFIG[ipx_profile]}" == "$profile" ]]; then
+break 2
+fi
+done
+colorize red "Invalid profile: ${CONFIG[ipx_profile]}"
+echo
+colorize yellow "Please choose one of: ${AVAILABLE_PROFILES[*]}"
+done
+prompt_with_default "Listen IP" $SERVER_IP CONFIG[ipx_listen_ip]
+while :; do
+prompt_with_default "Destination IP" "" CONFIG[ipx_dst_ip]
+if [[ -n "${CONFIG[ipx_dst_ip]}" ]]; then
+break
+fi
+colorize red "Destination IP cannot be empty."
+done
+interface=$(ip route show default | awk '{print $5}')
+prompt_with_default "Network Interface" $interface CONFIG[ipx_interface]
+if [[ "${CONFIG[ipx_profile]}" == "icmp" ]]; then
+prompt_with_default "ICMP Type" "0" CONFIG[ipx_icmp_type]
+prompt_with_default "ICMP Code" "0" CONFIG[ipx_icmp_code]
+fi
+echo ""
+}
+generate_toml_config() {
+local mode="$1"
+local output_file="$2"
+local is_tun="$3"
+local is_ipx="$4"
+{
+if [[ "$mode" == "server" ]] && [[ "$is_ipx" == "false" ]]; then
+echo "[listener]"
+echo "bind_addr = \"${CONFIG[bind_addr]}\""
+echo ""
+elif [[ "$is_ipx" == "false" ]]; then
+echo "[dialer]"
+echo "remote_addr = \"${CONFIG[remote_addr]}\""
+[[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = \"${CONFIG[edge_ip]}\""
+echo "dial_timeout = ${CONFIG[dial_timeout]}"
+echo "retry_interval = ${CONFIG[retry_interval]}"
+echo ""
+fi
+echo "[transport]"
+echo "type = \"${CONFIG[transport_type]}\""
+[[ -n "${CONFIG[nodelay]}" ]] && echo "nodelay = ${CONFIG[nodelay]}"
+[[ -n "${CONFIG[keepalive_period]}" ]] && echo "keepalive_period = ${CONFIG[keepalive_period]}"
+if [[ "$mode" == "server" ]]; then
+[[ -n "${CONFIG[accept_udp]}" ]] && echo "accept_udp = ${CONFIG[accept_udp]}"
+[[ -n "${CONFIG[proxy_protocol]}" ]] && echo "proxy_protocol = ${CONFIG[proxy_protocol]}"
+else
+[[ -n "${CONFIG[connection_pool]}" ]] && [[ "${CONFIG[connection_pool]}" != "0" ]] && \
+echo "connection_pool = ${CONFIG[connection_pool]}"
+fi
+[[ -n "${CONFIG[heartbeat_interval]}" ]] && echo "heartbeat_interval = ${CONFIG[heartbeat_interval]}"
+[[ -n "${CONFIG[heartbeat_timeout]}" ]] && echo "heartbeat_timeout = ${CONFIG[heartbeat_timeout]}"
+echo ""
+if [[ "$is_tun" == "true" ]]; then
+echo "[tun]"
+echo "encapsulation = \"${CONFIG[tun_encapsulation]}\""
+echo "name = \"${CONFIG[tun_name]}\""
+echo "local_addr = \"${CONFIG[tun_local_addr]}\""
+echo "remote_addr = \"${CONFIG[tun_remote_addr]}\""
+echo "health_port = ${CONFIG[tun_health_port]}"
+echo "mtu = ${CONFIG[tun_mtu]}"
+echo ""
+fi
+if [[ "$is_ipx" == "true" ]]; then
+echo "[ipx]"
+echo "mode = \"${CONFIG[ipx_mode]}\""
+echo "profile = \"${CONFIG[ipx_profile]}\""
+echo "listen_ip = \"${CONFIG[ipx_listen_ip]}\""
+echo "dst_ip = \"${CONFIG[ipx_dst_ip]}\""
+echo "interface = \"${CONFIG[ipx_interface]}\""
+[[ -n "${CONFIG[ipx_icmp_type]}" ]] && echo "icmp_type = ${CONFIG[ipx_icmp_type]}"
+[[ -n "${CONFIG[ipx_icmp_code]}" ]] && echo "icmp_code = ${CONFIG[ipx_icmp_code]}"
+echo ""
+fi
+if [[ "${CONFIG[transport_type]}" =~ mux$ ]]; then
+echo "[mux]"
+echo "mux_version = ${CONFIG[mux_version]}"
+echo "mux_framesize = ${CONFIG[mux_framesize]}"
+echo "mux_recievebuffer = ${CONFIG[mux_recievebuffer]}"
+echo "mux_streambuffer = ${CONFIG[mux_streambuffer]}"
+[[ -n "${CONFIG[mux_concurrency]}" ]] && echo "mux_concurrency = ${CONFIG[mux_concurrency]}"
+echo ""
+fi
+echo "[security]"
+echo "token = \"${CONFIG[token]}\""
+echo "enable_encryption = false"
+echo ""
+if [[ -n "${CONFIG[tls_sni]}" || -n "${CONFIG[tls_cert]}" ]]; then
