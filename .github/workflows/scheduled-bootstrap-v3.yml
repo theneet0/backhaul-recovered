@@ -1,0 +1,110 @@
+name: Publish recovered source
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: source-bootstrap
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect pending payload
+        id: gate
+        shell: bash
+        run: |
+          if [[ -f .bootstrap/part00 ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reconstruct source
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          EXPECTED_SHA256: 2023c4ff4e1fc364e29864a999227ce27e0dd90ba34c3c3c8328e42a4bbc5567
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat .bootstrap/part* > /tmp/project.b64
+          base64 --decode /tmp/project.b64 > /tmp/project.tar.gz
+          echo "${EXPECTED_SHA256}  /tmp/project.tar.gz" | sha256sum --check -
+          mkdir -p /tmp/project
+          tar -xzf /tmp/project.tar.gz -C /tmp/project
+          cp -a /tmp/project/. ./
+          sed -i 's/errors\.Net\.ErrClosed/errors.New("i\/o timeout")/g' internal/tunnel/runner.go
+          gofmt -w internal/tunnel/runner.go
+          rm -rf .bootstrap
+          rm -f .github/workflows/bootstrap.yml \
+                .github/workflows/scheduled-bootstrap.yml \
+                .github/workflows/scheduled-bootstrap-v2.yml \
+                .github/workflows/scheduled-bootstrap-v3.yml
+          chmod 0755 install.sh installer/backhaul.sh scripts/build-release.sh scripts/publish-github.sh tests/quick_install_test.sh tools/interop_original_tcp.py
+
+      - name: Publish source to main
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "publish recovered Backhaul source"
+          git push origin HEAD:main
+
+      - name: Set up Go
+        if: steps.gate.outputs.publish == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Validate published source
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./... -count=1
+          go vet ./...
+          bash -n install.sh installer/backhaul.sh scripts/build-release.sh scripts/publish-github.sh tests/quick_install_test.sh
+          python3 -m py_compile tools/interop_original_tcp.py
+          ./tests/quick_install_test.sh
+
+      - name: Build and publish release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v2.0.0-hotfix8-recovered.3
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG"
+            git push origin "$RELEASE_TAG"
+          fi
+          ./scripts/build-release.sh dist
+          assets=(dist/backhaul_linux_amd64 dist/backhaul_linux_arm64 dist/backhaul.sh dist/install.sh dist/SHA256SUMS)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --title "$RELEASE_TAG" --generate-notes --target "$(git rev-parse HEAD)"
+          fi
+
+      - name: Close temporary issue
+        if: steps.gate.outputs.publish == 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close 1 --repo "$GITHUB_REPOSITORY" --comment "Source, tag, and release published successfully." || true
