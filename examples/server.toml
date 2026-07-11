@@ -1,0 +1,23 @@
+# Public server: control channel on 3080, exposed service on 8080.
+[listener]
+bind_addr = "0.0.0.0:3080"
+
+[transport]
+type = "tcp"
+nodelay = true
+keepalive_period = 40
+accept_udp = false
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
+[security]
+# Replace this value in both files before use.
+token = "replace-with-a-long-random-token"
+
+[ports]
+# public-server-port=client-local-port
+mapping = ["8080=8080"]
+
+[logging]
+log_level = "info"
+
