@@ -219,75 +219,32 @@ type prefixedConn struct {
 	r *bufio.Reader
 }
 
-func (p prefixedConn) Read(b []byte) (int, error) { return p.r.Read(b) }
-
-func applyTCPOptions(conn net.Conn, nodelay bool, keepalive time.Duration) {
-	tcp, ok := conn.(*net.TCPConn)
-	if !ok {
-		if tc, ok := conn.(*tls.Conn); ok {
-			_ = tc
-		}
-		return
-	}
-	_ = tcp.SetNoDelay(nodelay)
-	if keepalive > 0 {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(keepalive)
-	}
+func (c prefixedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
 }
 
-func parseTransport(t string) (transportKind, error) {
-	t = strings.ToLower(strings.TrimSpace(t))
-	if t == "" {
-		t = "tcp"
-	}
-	var k transportKind
+// ValidateTransport reports whether raw is a transport name accepted by the
+// recovered runtime. It is used by configuration tooling before startup.
+func ValidateTransport(raw string) error {
+	_, err := parseTransport(raw)
+	return err
+}
+
+func parseTransport(raw string) (transportKind, error) {
+	t := strings.ToLower(strings.TrimSpace(raw))
 	switch t {
-	case "tcp", "raw", "reverse", "reverseraw", "unix", "tun":
-	case "tls", "anytls":
-		k.tls = true
-	case "ws":
-		k.ws = true
-	case "wsmux":
-		k.ws, k.mux = true, true
-	case "wss":
-		k.ws, k.tls = true, true
-	case "wssmux":
-		k.ws, k.tls, k.mux = true, true, true
-	case "http":
-		k.http = true
-	case "httpmux", "xhttpmux":
-		k.http, k.mux = true, true
-	case "https":
-		k.http, k.tls = true, true
-	case "httpsmux", "xhttpsmux":
-		k.http, k.tls, k.mux = true, true, true
+	case "", "tcp":
+		return transportKind{}, nil
+	case "kcp":
+		return transportKind{kcp: true}, nil
+	case "kcpmux", "xkcpmux":
+		return transportKind{kcp: true, mux: true}, nil
 	case "grpc":
-		k.grpc = true
-	case "grpcmux", "xgrpcmux":
-		k.grpc, k.mux = true, true
+		return transportKind{grpc: true}, nil
 	case "grpcs":
-		k.grpc, k.tls = true, true
+		return transportKind{grpc: true, tls: true}, nil
+	case "grpcmux", "xgrpcmux":
+		return transportKind{grpc: true, mux: true}, nil
 	case "grpcsmux", "xgrpcsmux":
-		k.grpc, k.tls, k.mux = true, true, true
-	case "kcp", "kuic":
-		k.kcp = true
-	case "kcpmux":
-		k.kcp, k.mux = true, true
-	case "udp":
-		k.udp = true
-	case "udpmux":
-		k.udp, k.mux = true, true
-	case "dns":
-		k.udp, k.dns = true, true
-	case "dnsmux":
-		k.udp, k.dns, k.mux = true, true, true
-	case "tcpmux", "xtcpmux", "slipstream", "sstream", "slipstreamtcp":
-		k.mux = true
-	case "slipstreammux", "slipstreamkcp", "sstreamkcp", "sstreammux":
-		k.mux, k.slip, k.kcp = true, true, true
-	default:
-		return transportKind{}, fmt.Errorf("unsupported transport: %s", t)
-	}
-	return k, nil
-}
+		return transportKind{grpc: true, tls: true, mux: true}, nil
+	case "http":
