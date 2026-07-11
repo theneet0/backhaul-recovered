@@ -1,16 +1,16 @@
 name: Bootstrap source
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.bootstrap/part04'
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   publish:
+    if: github.event.issue.pull_request == null && github.event.comment.body == 'PUBLISH'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -78,3 +78,9 @@ jobs:
             --title "$RELEASE_TAG" \
             --generate-notes \
             --target "$(git rev-parse HEAD)"
+
+      - name: Close trigger issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" --comment "Source, tag, and release published successfully."
