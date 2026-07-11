@@ -1,0 +1,147 @@
+name: Publish validated public release
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  RELEASE_TAG: v2.0.0-hotfix8-recovered.3
+
+jobs:
+  publish:
+    if: github.event.issue.pull_request == null && github.event.comment.body == 'PUBLISH_VALIDATED_RELEASE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Assemble final source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f .staging/runner.part.00
+          test -f .staging/runner.part.09
+          test -f .staging/installer.part.00
+          test -f .staging/installer.part.03
+          mkdir -p internal/tunnel installer
+          cat .staging/runner.part.* > internal/tunnel/runner.go
+          cat .staging/installer.part.* > installer/backhaul.sh
+          chmod 0755 install.sh installer/backhaul.sh scripts/*.sh tests/*.sh tools/interop_original_tcp.py
+          echo 'd2c26c74802cda81d01f1c6dfd65f5b8c4748230d86547237f0c7549a7710562  internal/tunnel/runner.go' | sha256sum --check -
+          echo 'cc097b07d5f5de5a8e139b2fb11f6f83a1839d9688066eccb9b7a05501da9336  installer/backhaul.sh' | sha256sum --check -
+          rm -f go.sum
+          go mod tidy
+          test -s go.sum
+
+      - name: Run complete validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./... -count=1
+          go vet ./...
+          bash -n install.sh installer/backhaul.sh scripts/build-release.sh scripts/publish-github.sh tests/quick_install_test.sh
+          ./tests/quick_install_test.sh
+
+      - name: Build release assets
+        shell: bash
+        run: ./scripts/build-release.sh dist
+
+      - name: Publish clean source tree
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .staging .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+          rm -f .github/workflows/assemble-large.yml
+          rm -f .github/workflows/finalize-public.yml
+          rm -f .github/workflows/diagnose-tests.yml
+          rm -f .github/workflows/diagnose-finalization.yml
+          rm -f .github/workflows/finalize-v2.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'finalize public release source'
+          git push origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch --tags --force --prune
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+            git fetch --tags --force --prune
+          elif git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git push origin ":refs/tags/$RELEASE_TAG"
+          fi
+          git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "$SOURCE_COMMIT"
+          git push origin "$RELEASE_TAG"
+          assets=(
+            dist/backhaul_linux_amd64
+            dist/backhaul_linux_arm64
+            dist/backhaul.sh
+            dist/install.sh
+            dist/SHA256SUMS
+          )
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            --target "$SOURCE_COMMIT"
+          expected=$'SHA256SUMS\nbackhaul.sh\nbackhaul_linux_amd64\nbackhaul_linux_arm64\ninstall.sh'
+          actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"
+
+      - name: Verify real public Quick Install
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install_root="$RUNNER_TEMP/public-install"
+          command_path="$RUNNER_TEMP/bin/backhaul"
+          mkdir -p "$(dirname "$command_path")"
+          BACKHAUL_VERSION="$RELEASE_TAG" \
+          BACKHAUL_INSTALL_DIR="$install_root" \
+          BACKHAUL_COMMAND_PATH="$command_path" \
+            bash install.sh --no-menu
+          "$install_root/backhaul_premium" -v | grep -F 'backhaul_recovered v2.0.0-hotfix8-recovered.3'
+          test -x "$install_root/backhaul.sh"
+          test -x "$command_path"
+          test "$("$command_path" --list-transports | wc -l | tr -d ' ')" = '40'
+          grep -q '^repository=theneet0/backhaul-recovered$' "$install_root/INSTALL_SOURCE"
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "PUBLIC_RELEASE_SUCCESS tag=$RELEASE_TAG commit=$SOURCE_COMMIT release=https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason completed
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "PUBLIC_RELEASE_FAILED run=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
