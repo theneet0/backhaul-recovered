@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+
+SCRIPT_VERSION="v1.1.0-privacy-local"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+service_dir="${BACKHAUL_SERVICE_DIR:-/etc/systemd/system}"
+config_dir="${BACKHAUL_CONFIG_DIR:-/root/backhaul-core}"
+CERT_DIR="$config_dir/cert_files"
+CERT_FILE="$CERT_DIR/cert.crt"
+KEY_FILE="$CERT_DIR/cert.key"
+SERVER_IP="${BACKHAUL_SERVER_IP:-127.0.0.1}"
+SUPPORTED_TRANSPORTS=(
+tcp
+kcp kcpmux xkcpmux
+grpc grpcs grpcmux xgrpcmux grpcsmux xgrpcsmux
+http https httpmux xhttpmux httpsmux xhttpsmux
+udp udpmux xudpmux
+dns dnsmux xdnsmux
+slipstream slip sstream slipstreammux slipmux sstreammux
+raw rawsocket socketraw
+tun anytls tcpmux xtcpmux
+ws wss wsmux xwsmux wssmux
+)
+colorize() {
+local color="$1"
+local text="$2"
+local style="${3:-normal}"
+local black="\033[30m" red="\033[31m" green="\033[32m" yellow="\033[33m"
+local blue="\033[34m" magenta="\033[35m" cyan="\033[36m" white="\033[37m"
+local reset="\033[0m" normal="\033[0m" bold="\033[1m" underline="\033[4m"
+local color_code
+case $color in
+black) color_code=$black ;; red) color_code=$red ;;
+green) color_code=$green ;; yellow) color_code=$yellow ;;
+blue) color_code=$blue ;; magenta) color_code=$magenta ;;
+cyan) color_code=$cyan ;; white) color_code=$white ;;
+*) color_code=$reset ;;
+esac
+local style_code
+case $style in
+bold) style_code=$bold ;; underline) style_code=$underline ;;
+normal | *) style_code=$normal ;;
+esac
+echo -e "${style_code}${color_code}${text}${reset}"
+}
+require_root() {
+if [[ $EUID -ne 0 ]]; then
+echo "This operation must be run as root"
+return 1
+fi
+}
+initialize_manager() {
+local detected_ip
+require_root || exit 1
+mkdir -p "$CERT_DIR"
+if [[ -z "${BACKHAUL_SERVER_IP:-}" ]]; then
+detected_ip=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+[[ -n "$detected_ip" ]] && SERVER_IP="$detected_ip"
+fi
+}
+press_key() {
+read -r -p "Press any key to continue..."
+}
+prompt_with_default() {
+local prompt="$1"
+local default="$2"
+local var_name="$3"
+local input
+echo -ne "[-] $prompt (default: $default): "
+read -r input
+eval "$var_name=\"${input:-$default}\""
+}
+prompt_boolean() {
+local prompt="$1"
+local default="$2"
+local var_name="$3"
+while true; do
+prompt_with_default "$prompt [true/false]" "$default" "$var_name"
+local value="${!var_name}"
+if [[ "$value" == "true" || "$value" == "false" ]]; then
+break
+fi
+colorize red "Invalid input. Please enter 'true' or 'false'."
+done
+}
+validate_cidr() {
+local cidr="$1"
+if [[ ! "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$ ]]; then
+return 1
+fi
+IFS='/' read -r ip mask <<< "$cidr"
+IFS='.' read -r a b c d <<< "$ip"
+if (( a<0 || a>255 || b<0 || b>255 || c<0 || c>255 || d<0 || d>255 )); then
+return 1
+fi
+if (( mask < 1 || mask > 32 )); then
+return 1
+fi
+local ip_int=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+local mask_int
+if (( mask == 32 )); then
+mask_int=0xFFFFFFFF
+else
+mask_int=$(( (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF ))
+fi
+local net_int=$(( ip_int & mask_int ))
+local broadcast_int=$(( net_int | (~mask_int & 0xFFFFFFFF) ))
+if (( ip_int == net_int )); then
+return 1
+fi
+if (( ip_int == broadcast_int )); then
+return 1
+fi
+return 0
+}
+resolve_local_backhaul_binary() {
+local arch binary_name candidate
+arch=$(uname -m)
+case "$arch" in
+x86_64) binary_name="backhaul_recovered_linux_amd64" ;;
+arm64|aarch64) binary_name="backhaul_recovered_linux_arm64" ;;
+*) colorize red "Unsupported architecture: $arch"; return 1 ;;
+esac
+for candidate in \
+"${BACKHAUL_BINARY:-}" \
+"$SCRIPT_DIR/../dist/$binary_name" \
+"$SCRIPT_DIR/../../bin/$binary_name" \
+"$SCRIPT_DIR/../bin/$binary_name" \
+"$PWD/$binary_name"
+do
+if [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]]; then
+printf '%s\n' "$candidate"
+return 0
+fi
+done
+return 1
+}
+install_local_backhaul() {
+local mode="${1:-startup}" source_binary version_output
+if [[ -x "${config_dir}/backhaul_premium" && "$mode" != "menu" ]]; then
+return 0
+fi
+source_binary=$(resolve_local_backhaul_binary) || {
+colorize red "No local recovered binary found. Set BACKHAUL_BINARY=/absolute/path/to/binary."
+return 1
+}
+version_output=$("$source_binary" -v 2>&1) || {
+colorize red "Local binary version check failed: $source_binary"
+return 1
+}
+if [[ "$version_output" != backhaul_recovered\ v2.0.0-hotfix8-recovered.* ]]; then
+colorize red "Unexpected binary identity: $version_output"
+return 1
+fi
+mkdir -p "$config_dir"
+install -m 0755 -- "$source_binary" "${config_dir}/backhaul_premium"
+colorize green "Local recovered core installed: $version_output" bold
+colorize cyan "No download, update check, or host-information request was performed."
+}
+declare -A CONFIG
+reset_config() {
+CONFIG=()
+}
+prompt_connection_section() {
+local mode="$1"  # server or client
+colorize blue "━━━ Connection Configuration ━━━" bold
+if [[ "$mode" == "server" ]]; then
+prompt_with_default "Bind Address" ":8443" CONFIG[bind_addr]
+if [[ -n "${CONFIG[bind_addr]}" && "${CONFIG[bind_addr]}" != *:* ]]; then
+CONFIG[bind_addr]=":${CONFIG[bind_addr]}"
+fi
+else
+while true; do
+echo -ne "[*] IRAN Server Address [IP:Port] or [Domain:Port]: "
+read -r CONFIG[remote_addr]
+if [[ -z "${CONFIG[remote_addr]}" ]]; then
+colorize red "Server address cannot be empty."
+continue
+fi
+if [[ "${CONFIG[remote_addr]}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ || \
+"${CONFIG[remote_addr]}" =~ ^[a-zA-Z0-9.-]+:[0-9]{1,5}$ ]]; then
+break
+else
+colorize red "Invalid format. Use IP:Port or Domain:Port."
+fi
+done
+if [[ "${CONFIG[transport_type]}" == "ws" || "${CONFIG[transport_type]}" == "wss" || "${CONFIG[transport_type]}" == "wsmux" || "${CONFIG[transport_type]}" == "wssmux" || "${CONFIG[transport_type]}" == "xwsmux" ]]; then
+echo -ne "[-] Edge IP/Domain (optional, press Enter to skip): "
+read -r CONFIG[edge_ip]
+fi
+CONFIG[dial_timeout]="10"
+CONFIG[retry_interval]="3"
+fi
+echo ""
+}
+prompt_security_section() {
+colorize blue "━━━ Security Configuration ━━━" bold
+prompt_with_default "Security Token" "your_token" CONFIG[token]
+CONFIG[enable_encryption]="false"
+echo ""
+}
+prompt_transport_section() {
+local mode="$1"
+local is_ipx="false"
+colorize blue "━━━ Transport Configuration ━━━" bold
+local valid_transports=("${SUPPORTED_TRANSPORTS[@]}")
+echo "Available transports:"
+printf '  • %s\n' "${valid_transports[@]}"
+while true; do
+echo -ne "Select transport: "
+read -r CONFIG[transport_type]
+[[ " ${valid_transports[*]} " =~ " ${CONFIG[transport_type]} " ]] && break
+colorize red "Invalid transport."
+done
+if [[ "${CONFIG[transport_type]}" == "tun" ]]; then
+echo
+local encapsulations=(tcp ipx)
+echo "Available encapsulations:"
+printf '  • %s\n' "${encapsulations[@]}"
+while true; do
+echo -ne "Select encapsulation: "
+read -r CONFIG[tun_encapsulation]
+[[ " ${encapsulations[*]} " =~ " ${CONFIG[tun_encapsulation]} " ]] && break
+colorize red "Invalid encapsulation."
+done
+fi
+echo
+if [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]]; then
+is_ipx="true"
+fi
+if [[ "$is_ipx" != "true" ]]; then
+prompt_boolean "Enable TCP_NODELAY" "true" CONFIG[nodelay]
+fi
+if [[ "$mode" == "server" ]]; then
+prompt_boolean "Accept UDP relay" "false" CONFIG[accept_udp]
+if [[ ! "${CONFIG[transport_type]}" =~ ^(tun|ws)$ ]] && [[ "$is_ipx" != "true" ]]; then
+prompt_boolean "Enable Proxy Protocol" "false" CONFIG[proxy_protocol]
+fi
+else
+if [[ "${CONFIG[transport_type]}" != "tun" ]]; then
+prompt_with_default "Connection Pool" "8" CONFIG[connection_pool]
+fi
+fi
+CONFIG[heartbeat_interval]="10"
+CONFIG[heartbeat_timeout]="25"
+if [[ "$is_ipx" != "true" ]]; then
+CONFIG[keepalive_period]="40"
+fi
+echo ""
+}
+prompt_mux_section() {
