@@ -1,16 +1,16 @@
 name: Bootstrap source
 
 on:
-  issue_comment:
-    types: [created]
+  push:
+    branches: [main]
+    paths:
+      - '.bootstrap/part04'
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
   publish:
-    if: github.event.issue.pull_request == null && github.event.comment.body == 'PUBLISH'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -20,20 +20,17 @@ jobs:
 
       - name: Reconstruct source archive
         env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
           EXPECTED_SHA256: 2023c4ff4e1fc364e29864a999227ce27e0dd90ba34c3c3c8328e42a4bbc5567
         shell: bash
         run: |
           set -Eeuo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}" --jq '.body' > /tmp/project.b64
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-            --jq '.[] | select(.body != "PUBLISH") | .body' >> /tmp/project.b64
+          cat .bootstrap/part* > /tmp/project.b64
           base64 --decode /tmp/project.b64 > /tmp/project.tar.gz
           echo "${EXPECTED_SHA256}  /tmp/project.tar.gz" | sha256sum --check -
           mkdir -p /tmp/project
           tar -xzf /tmp/project.tar.gz -C /tmp/project
           cp -a /tmp/project/. ./
+          rm -rf .bootstrap
           rm -f .github/workflows/bootstrap.yml
           chmod 0755 install.sh installer/backhaul.sh scripts/build-release.sh scripts/publish-github.sh tests/quick_install_test.sh tools/interop_original_tcp.py
 
@@ -81,10 +78,3 @@ jobs:
             --title "$RELEASE_TAG" \
             --generate-notes \
             --target "$(git rev-parse HEAD)"
-
-      - name: Close transfer issue
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --comment "Source, tag, and release published successfully."
