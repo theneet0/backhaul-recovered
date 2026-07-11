@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// These values were recovered from the v2.0.0-hotfix8 TCP wire format.
+// Frames containing strings are: uint16(big endian) length, one signal byte,
+// then the string bytes. Control messages are one signal byte.
 const (
 	originalSignalClosed    byte = 0x00
 	originalSignalHeartbeat byte = 0x01
@@ -66,6 +69,7 @@ func normalizeOriginalTarget(target string) (string, error) {
 	if target == "" {
 		return "", errors.New("empty original protocol target")
 	}
+
 	if strings.HasPrefix(target, ":") {
 		port := strings.TrimPrefix(target, ":")
 		if err := validateOriginalPort(port); err != nil {
@@ -136,6 +140,7 @@ type originalServerState struct {
 	token       string
 	readTimeout time.Duration
 	workers     chan net.Conn
+
 	handshakeMu sync.Mutex
 	controlMu   sync.RWMutex
 	control     *originalControl
@@ -145,7 +150,12 @@ func newOriginalServerState(ctx context.Context, token string, readTimeout time.
 	if readTimeout <= 0 {
 		readTimeout = 25 * time.Second
 	}
-	return &originalServerState{ctx: ctx, token: token, readTimeout: readTimeout, workers: make(chan net.Conn, 512)}
+	return &originalServerState{
+		ctx:         ctx,
+		token:       token,
+		readTimeout: readTimeout,
+		workers:     make(chan net.Conn, 512),
+	}
 }
 
 func (s *originalServerState) currentControl() *originalControl {
@@ -179,12 +189,14 @@ func (s *originalServerState) handleAccepted(conn net.Conn, opts ServerOpts) {
 		s.enqueueWorker(conn)
 		return
 	}
+
 	s.handshakeMu.Lock()
 	defer s.handshakeMu.Unlock()
 	if s.currentControl() != nil {
 		s.enqueueWorker(conn)
 		return
 	}
+
 	_ = conn.SetReadDeadline(time.Now().Add(s.readTimeout))
 	token, signal, err := readOriginalTypedString(conn)
 	if err != nil || signal != originalSignalHello || token != s.token {
@@ -234,6 +246,7 @@ func (s *originalServerState) monitorControl(control *originalControl, opts Serv
 			}
 		}
 	}()
+
 	_ = control.writeSignal(originalSignalRTT)
 	heartbeat := opts.HeartbeatInterval
 	if heartbeat <= 0 {
@@ -265,9 +278,14 @@ func (s *originalServerState) monitorControl(control *originalControl, opts Serv
 				return
 			case originalSignalHeartbeat:
 				if !timer.Stop() {
-					select { case <-timer.C: default: }
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
 				timer.Reset(timeout)
+			case originalSignalRTT:
+				// RTT reply is acknowledged by receipt.
 			}
 		case <-timer.C:
 			return
@@ -281,9 +299,12 @@ func (s *originalServerState) acquireWorker(ctx context.Context, target string, 
 	defer ticker.Stop()
 	for control == nil {
 		control = s.currentControl()
-		if control != nil { break }
+		if control != nil {
+			break
+		}
 		select {
-		case <-ctx.Done(): return nil, ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -291,6 +312,7 @@ func (s *originalServerState) acquireWorker(ctx context.Context, target string, 
 		s.clearControl(control)
 		return nil, err
 	}
+
 	select {
 	case worker := <-s.workers:
 		if err := writeOriginalTypedString(worker, signal, originalWireTarget(target)); err != nil {
@@ -305,40 +327,59 @@ func (s *originalServerState) acquireWorker(ctx context.Context, target string, 
 
 func runOriginalTCPServer(ctx context.Context, opts ServerOpts) error {
 	ln, err := net.Listen("tcp", opts.BindAddr)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer ln.Close()
 	state := newOriginalServerState(ctx, opts.Token, opts.HeartbeatTimeout)
 	errCh := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
-		if control := state.currentControl(); control != nil { control.close() }
+		if control := state.currentControl(); control != nil {
+			control.close()
+		}
 	}()
 	go func() {
 		for {
 			conn, acceptErr := ln.Accept()
 			if acceptErr != nil {
-				if ctx.Err() == nil { select { case errCh <- acceptErr: default: } }
+				if ctx.Err() == nil {
+					select {
+					case errCh <- acceptErr:
+					default:
+					}
+				}
 				return
 			}
 			go state.handleAccepted(conn, opts)
 		}
 	}()
-	if opts.Logger != nil { opts.Logger.Printf("original-compatible TCP control listener on %s", ln.Addr()) }
+	if opts.Logger != nil {
+		opts.Logger.Printf("original-compatible TCP control listener on %s", ln.Addr())
+	}
+
 	for _, mapping := range opts.Mappings {
 		m := mapping
 		if err := startPublicListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
 			return state.acquireWorker(reqCtx, target, originalSignalTCP)
-		}); err != nil { return err }
+		}); err != nil {
+			return err
+		}
 		if opts.AcceptUDP {
 			if err := startPublicUDPListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
 				return state.acquireWorker(reqCtx, target, originalSignalUDP)
-			}); err != nil { return err }
+			}); err != nil {
+				return err
+			}
 		}
 	}
+
 	select {
-	case <-ctx.Done(): return nil
-	case err := <-errCh: return err
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
 	}
 }
 
@@ -349,38 +390,62 @@ func runOriginalTCPClient(ctx context.Context, opts ClientOpts) error {
 		conn, err := dialer.DialContext(ctx, "tcp", opts.RemoteAddr)
 		if err != nil {
 			select {
-			case <-ctx.Done(): return nil
-			case <-time.After(opts.RetryInterval): continue
+			case <-ctx.Done():
+				return nil
+			case <-time.After(opts.RetryInterval):
+				continue
 			}
 		}
 		applyTCPOptions(conn, true, opts.Keepalive)
 		_ = conn.SetDeadline(time.Now().Add(opts.HeartbeatTimeout))
-		if err := writeOriginalTypedString(conn, originalSignalHello, opts.Token); err != nil { _ = conn.Close(); continue }
+		if err := writeOriginalTypedString(conn, originalSignalHello, opts.Token); err != nil {
+			_ = conn.Close()
+			continue
+		}
 		token, signal, err := readOriginalTypedString(conn)
-		if err != nil || signal != originalSignalChannel || token != opts.Token { _ = conn.Close(); continue }
+		if err != nil || signal != originalSignalChannel || token != opts.Token {
+			_ = conn.Close()
+			continue
+		}
 		_ = conn.SetDeadline(time.Time{})
 		control = conn
 		break
 	}
 	defer control.Close()
-	if opts.Logger != nil { opts.Logger.Printf("original-compatible TCP control channel established") }
+	if opts.Logger != nil {
+		opts.Logger.Printf("original-compatible TCP control channel established")
+	}
+
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
-	for i := 0; i < opts.PoolSize; i++ { go runOriginalWorker(workerCtx, opts) }
-	go func() { <-ctx.Done(); _ = control.Close() }()
+	for i := 0; i < opts.PoolSize; i++ {
+		go runOriginalWorker(workerCtx, opts)
+	}
+	go func() {
+		<-ctx.Done()
+		_ = control.Close()
+	}()
+
 	for {
 		signal, err := readOriginalSignal(control)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) { return nil }
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			return err
 		}
 		switch signal {
 		case originalSignalChannel:
 			go runOriginalWorker(workerCtx, opts)
 		case originalSignalRTT:
-			if err := writeOriginalSignal(control, originalSignalRTT); err != nil { return err }
+			err = writeOriginalSignal(control, originalSignalRTT)
+			if err != nil {
+				return err
+			}
 		case originalSignalHeartbeat:
-			if err := writeOriginalSignal(control, originalSignalHeartbeat); err != nil { return err }
+			if err := writeOriginalSignal(control, originalSignalHeartbeat); err != nil {
+				return err
+			}
 		case originalSignalClosed:
 			return nil
 		}
@@ -390,18 +455,30 @@ func runOriginalTCPClient(ctx context.Context, opts ClientOpts) error {
 func runOriginalWorker(ctx context.Context, opts ClientOpts) {
 	dialer := net.Dialer{Timeout: opts.DialTimeout}
 	worker, err := dialer.DialContext(ctx, "tcp", opts.RemoteAddr)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer worker.Close()
 	applyTCPOptions(worker, opts.NoDelay, opts.Keepalive)
-	go func() { <-ctx.Done(); _ = worker.Close() }()
+	go func() {
+		<-ctx.Done()
+		_ = worker.Close()
+	}()
+
 	target, signal, err := readOriginalTypedString(worker)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	target, err = normalizeOriginalTarget(target)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	switch signal {
 	case originalSignalTCP:
 		upstream, err := dialer.DialContext(ctx, "tcp", target)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		defer upstream.Close()
 		applyTCPOptions(upstream, opts.NoDelay, opts.Keepalive)
 		bridge(worker, upstream)
