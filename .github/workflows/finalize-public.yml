@@ -54,7 +54,6 @@ jobs:
           106108ee749ce3520e6284802d6e9f1f128dfd7609261db3822ea513b5230929  ./examples/client.toml
           865d9ffac4aae3e641b7e67cd4bea160c96cf0ecdab40d6f782a50e954233514  ./examples/server.toml
           682594efd0b1fb0051d1e88bf9e58b7db85db84a51792e82761cbca915aaf2ab  ./go.mod
-          fea9aa3d462cf4ea1567c8f00c276f49e2911e2468ae2ff829145a86116848f1  ./go.sum
           59c91557f9e3ede0078411b46b31aa7c6cba034190905ee4fece3b548a49dcc8  ./install.sh
           cc097b07d5f5de5a8e139b2fb11f6f83a1839d9688066eccb9b7a05501da9336  ./installer/backhaul.sh
           b4ac9173dbd69762bba9b32922cfaa74ca4c9090cd68dc6238fe55a07e666313  ./internal/app/app.go
@@ -81,6 +80,10 @@ jobs:
             } >> "$GITHUB_ENV"
             exit 1
           fi
+          rm -f go.sum
+          go mod tidy
+          test -s go.sum
+          git diff --exit-code -- go.mod
 
       - name: Run complete validation
         shell: bash
