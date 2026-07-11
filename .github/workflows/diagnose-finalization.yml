@@ -1,0 +1,67 @@
+name: Diagnose finalization
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    if: github.event.issue.pull_request == null && github.event.comment.body == 'DIAGNOSE_FINALIZATION'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect transfer files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set +e
+          report=/tmp/diagnostic.txt
+          : > "$report"
+          for f in \
+            .staging/runner.part.00 \
+            .staging/runner.part.09 \
+            .staging/installer.part.00 \
+            .staging/installer.part.03 \
+            install.sh \
+            scripts/build-release.sh \
+            scripts/publish-github.sh \
+            tests/quick_install_test.sh \
+            tools/interop_original_tcp.py \
+            .github/workflows/ci.yml \
+            .github/workflows/release.yml; do
+            if [[ -f "$f" ]]; then
+              echo "FOUND $f" >> "$report"
+            else
+              echo "MISSING $f" >> "$report"
+            fi
+          done
+
+          mkdir -p /tmp/assembled
+          if cat .staging/runner.part.* > /tmp/assembled/runner.go 2>>"$report"; then
+            echo "RUNNER_SHA256 $(sha256sum /tmp/assembled/runner.go | awk '{print $1}')" >> "$report"
+            echo "RUNNER_SIZE $(wc -c < /tmp/assembled/runner.go)" >> "$report"
+          else
+            echo "RUNNER_CAT_FAILED" >> "$report"
+          fi
+          if cat .staging/installer.part.* > /tmp/assembled/backhaul.sh 2>>"$report"; then
+            echo "INSTALLER_SHA256 $(sha256sum /tmp/assembled/backhaul.sh | awk '{print $1}')" >> "$report"
+            echo "INSTALLER_SIZE $(wc -c < /tmp/assembled/backhaul.sh)" >> "$report"
+          else
+            echo "INSTALLER_CAT_FAILED" >> "$report"
+          fi
+
+          {
+            echo 'FINALIZATION_DIAGNOSTIC'
+            echo
+            echo '```text'
+            cat "$report"
+            echo '```'
+          } > /tmp/body.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/body.md
