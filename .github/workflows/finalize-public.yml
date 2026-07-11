@@ -1,0 +1,160 @@
+name: Finalize public release
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  RELEASE_TAG: v2.0.0-hotfix8-recovered.3
+
+jobs:
+  finalize:
+    if: github.event.issue.pull_request == null && github.event.comment.body == 'FINALIZE_PUBLIC_RELEASE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Assemble and verify exact source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f .staging/runner.part.00
+          test -f .staging/runner.part.09
+          test -f .staging/installer.part.00
+          test -f .staging/installer.part.03
+          mkdir -p internal/tunnel installer
+          cat .staging/runner.part.* > internal/tunnel/runner.go
+          cat .staging/installer.part.* > installer/backhaul.sh
+          chmod 0755 install.sh installer/backhaul.sh scripts/*.sh tests/*.sh tools/interop_original_tcp.py
+
+          cat > /tmp/SOURCE_SHA256 <<'EOF_SHA256'
+          52e6e8bcacc1caba314bc0544482919588873fca7fb51dae3f765d00da0bd5a7  ./.github/workflows/ci.yml
+          f246400482588b933321373a2adcd32fa5a1e701bf579e9263a8a2831e964755  ./.github/workflows/release.yml
+          99b6911b4e5b46d1a8a250daf2f2af023f617ab71766f3d84b18a58bec0e4ea4  ./.gitignore
+          9a0d0232101a795fe300fd3225234d6975389254f1da8937b5497fac03b5a4f0  ./PRIVACY.md
+          ce67c8f7a27475c974f9bc21a0121ba725efac9bcc5c73af966974ab7b007eca  ./README.md
+          d5a1c1cfabfc113a4cf1fa206d05c1b7edfa5b27bb587071bbfe89866e4c911b  ./RECOVERY_REPORT.md
+          d471740d711e91d4e9a2ee90aa80539902aa07b0abc5eed2777f1cf94378a785  ./TRANSPORT_MATRIX.md
+          4d623fdf44d395f966ed8c68a07f4a50218dd22b7cb7d464a33a6b5884d6c9f5  ./WORKLOG.md
+          fe6b69881ec6f53096ba169f25971517ce6f4476e5b0d068324c7e010fece749  ./cmd/backhaul/main.go
+          106108ee749ce3520e6284802d6e9f1f128dfd7609261db3822ea513b5230929  ./examples/client.toml
+          865d9ffac4aae3e641b7e67cd4bea160c96cf0ecdab40d6f782a50e954233514  ./examples/server.toml
+          682594efd0b1fb0051d1e88bf9e58b7db85db84a51792e82761cbca915aaf2ab  ./go.mod
+          fea9aa3d462cf4ea1567c8f00c276f49e2911e2468ae2ff829145a86116848f1  ./go.sum
+          59c91557f9e3ede0078411b46b31aa7c6cba034190905ee4fece3b548a49dcc8  ./install.sh
+          cc097b07d5f5de5a8e139b2fb11f6f83a1839d9688066eccb9b7a05501da9336  ./installer/backhaul.sh
+          b4ac9173dbd69762bba9b32922cfaa74ca4c9090cd68dc6238fe55a07e666313  ./internal/app/app.go
+          c2625a7b01251148904835cad45e2a678e2ca238365283a1d9be85604da3f340  ./internal/cfg/bash_manager_test.go
+          a836212ef542f992fa4864712cb34c6f3796435e91300d26faeea90aadac35c9  ./internal/cfg/config.go
+          4df1623383f4bbf9e33d05f988602334ec180aa02340161c6a8385d2e1d4b15c  ./internal/privacy/privacy_test.go
+          0ef6e0af276530042fa3091e839874e273899ba544b69159197f6dd8045932ba  ./internal/tunnel/mapping.go
+          e5bf9b90b985ec40611c253017a28452315e222ab2eee0de8f6026003083267f  ./internal/tunnel/original_protocol.go
+          6660ebdb22d17046f7613d40669712415a315d985eede361a855e29ab97a5a58  ./internal/tunnel/original_protocol_test.go
+          d2c26c74802cda81d01f1c6dfd65f5b8c4748230d86547237f0c7549a7710562  ./internal/tunnel/runner.go
+          b42914c3281e81ce9745763a06cf54be1f8b47298ab36ce998fbea2941f78425  ./internal/tunnel/transports_e2e_test.go
+          8d75eac68220a56f081c82525903d9689696376d6b654f905387b1a0912380f2  ./scripts/build-release.sh
+          b622da567f039b08cd3ec8de0f6f69b233e5953e35029a345f846f0e72ee1f81  ./scripts/publish-github.sh
+          9f9904354ba4c38d11c0d6f7655a3ef666add040f9df2956275107e14bd4dc48  ./tests/quick_install_test.sh
+          9c9aa7c91da8de408690b9f1874a687e459e7d3b23fbdacbb9e95bb3ec70b3db  ./tools/interop_original_tcp.py
+          EOF_SHA256
+          sed -i 's/^          //' /tmp/SOURCE_SHA256
+          sha256sum --check /tmp/SOURCE_SHA256
+
+      - name: Run complete validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test ./... -count=1
+          go vet ./...
+          bash -n install.sh installer/backhaul.sh scripts/build-release.sh scripts/publish-github.sh tests/quick_install_test.sh
+          ./tests/quick_install_test.sh
+
+      - name: Build release assets
+        run: ./scripts/build-release.sh dist
+
+      - name: Clean transfer files and publish final source
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .staging .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+          rm -f .github/workflows/assemble-large.yml
+          rm -f .github/workflows/finalize-public.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'finalize public source tree'
+            git push origin HEAD:main
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch --tags --force
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+            git fetch --prune --tags --force
+          elif git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git push origin ":refs/tags/$RELEASE_TAG"
+          fi
+          git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "${{ steps.source.outputs.commit }}"
+          git push origin "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" \
+            dist/backhaul_linux_amd64 \
+            dist/backhaul_linux_arm64 \
+            dist/backhaul.sh \
+            dist/install.sh \
+            dist/SHA256SUMS \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            --target "${{ steps.source.outputs.commit }}"
+
+      - name: Verify public Quick Install from the Release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install_root="$RUNNER_TEMP/public-install"
+          command_path="$RUNNER_TEMP/bin/backhaul"
+          mkdir -p "$(dirname "$command_path")"
+          BACKHAUL_VERSION="$RELEASE_TAG" \
+          BACKHAUL_INSTALL_DIR="$install_root" \
+          BACKHAUL_COMMAND_PATH="$command_path" \
+            bash install.sh --no-menu
+          "$install_root/backhaul_premium" -v | grep -F 'backhaul_recovered v2.0.0-hotfix8-recovered.'
+          test -x "$command_path"
+
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "PUBLIC_RELEASE_SUCCESS tag=$RELEASE_TAG commit=${{ steps.source.outputs.commit }} release=https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "PUBLIC_RELEASE_FAILED run=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
