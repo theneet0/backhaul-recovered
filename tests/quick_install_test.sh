@@ -31,7 +31,7 @@ install -m 0755 "${ROOT_DIR}/installer/backhaul.sh" "${RELEASE_DIR}/backhaul.sh"
 
 PORT="$(python3 - <<'PY'
 import socket
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+with socket.socket() as sock:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
 PY
@@ -63,6 +63,7 @@ test "$("${INSTALL_ROOT}/bin/backhaul" --list-transports | wc -l | tr -d ' ')" =
 grep -q '^repository=theneet0/backhaul-recovered$' \
   "${INSTALL_ROOT}/core/INSTALL_SOURCE"
 
+# A modified release asset must be rejected by the checksum verification.
 printf '\ncorrupted\n' >> "${RELEASE_DIR}/backhaul_linux_amd64"
 if BACKHAUL_RELEASE_BASE_URL="http://127.0.0.1:${PORT}" \
   "${ROOT_DIR}/install.sh" \
