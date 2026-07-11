@@ -1,0 +1,250 @@
+package tunnel
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	kcp "github.com/xtaci/kcp-go/v5"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
+)
+
+const (
+	roleWorker = "WORKER"
+	roleMux    = "MUX"
+
+	frameOpen  = 1
+	frameData  = 2
+	frameClose = 3
+
+	slipMagic = "SLP1"
+)
+
+type ServerOpts struct {
+	BindAddr          string
+	Transport         string
+	Token             string
+	Mappings          []PortMapping
+	AcceptUDP         bool
+	NoDelay           bool
+	Keepalive         time.Duration
+	HeartbeatInterval time.Duration
+	HeartbeatTimeout  time.Duration
+	TLSCert           string
+	TLSKey            string
+	Logger            *log.Logger
+}
+
+type ClientOpts struct {
+	RemoteAddr        string
+	Transport         string
+	Token             string
+	DialTimeout       time.Duration
+	RetryInterval     time.Duration
+	PoolSize          int
+	NoDelay           bool
+	Keepalive         time.Duration
+	HeartbeatInterval time.Duration
+	HeartbeatTimeout  time.Duration
+	TLSServerName     string
+	Logger            *log.Logger
+}
+
+type transportKind struct {
+	ws   bool
+	http bool
+	grpc bool
+	kcp  bool
+	tls  bool
+	mux  bool
+	slip bool
+	udp  bool
+	dns  bool
+}
+
+func RunServer(ctx context.Context, opts ServerOpts) error {
+	if opts.Logger == nil {
+		opts.Logger = log.Default()
+	}
+	if usesOriginalTCPProtocol(opts.Transport) {
+		return runOriginalTCPServer(ctx, opts)
+	}
+	kind, err := parseTransport(opts.Transport)
+	if err != nil {
+		return err
+	}
+	if opts.HeartbeatTimeout <= 0 {
+		opts.HeartbeatTimeout = 25 * time.Second
+	}
+
+	if kind.mux {
+		return runMuxServer(ctx, opts, kind)
+	}
+	return runWorkerServer(ctx, opts, kind)
+}
+
+func runWorkerServer(ctx context.Context, opts ServerOpts, kind transportKind) error {
+	workerPool := make(chan net.Conn, 512)
+	errCh := make(chan error, 1)
+
+	handler := func(conn net.Conn) {
+		authConn, role, err := authenticateControlConn(conn, opts.Token, opts.HeartbeatTimeout)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		if role != roleWorker {
+			_ = authConn.Close()
+			return
+		}
+		select {
+		case workerPool <- authConn:
+		case <-ctx.Done():
+			_ = authConn.Close()
+		}
+	}
+
+	go acceptControl(ctx, opts, kind, handler, errCh)
+
+	for _, m := range opts.Mappings {
+		if err := startPublicListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
+			for {
+				var worker net.Conn
+				select {
+				case worker = <-workerPool:
+				case <-reqCtx.Done():
+					return nil, reqCtx.Err()
+				}
+				if _, err := io.WriteString(worker, target+"\n"); err != nil {
+					_ = worker.Close()
+					continue
+				}
+				return worker, nil
+			}
+		}); err != nil {
+			return err
+		}
+		if opts.AcceptUDP {
+			if err := startPublicUDPListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
+				for {
+n					var worker net.Conn
+					select {
+					case worker = <-workerPool:
+					case <-reqCtx.Done():
+						return nil, reqCtx.Err()
+					}
+					if _, err := io.WriteString(worker, "UDP "+target+"\n"); err != nil {
+						_ = worker.Close()
+						continue
+					}
+					return worker, nil
+				}
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+func runMuxServer(ctx context.Context, opts ServerOpts, kind transportKind) error {
+	holder := &simpleMuxHolder{}
+	errCh := make(chan error, 1)
+
+	handler := func(conn net.Conn) {
+		authConn, role, err := authenticateControlConn(conn, opts.Token, opts.HeartbeatTimeout)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		if role != roleMux {
+			_ = authConn.Close()
+			return
+		}
+		sess := newSimpleMuxSession(authConn)
+		holder.Add(sess)
+		go func() {
+			<-ctx.Done()
+			_ = sess.Close()
+		}()
+		go func() {
+			<-sess.Done()
+			holder.Remove(sess)
+		}()
+	}
+
+	go acceptControl(ctx, opts, kind, handler, errCh)
+
+	for _, m := range opts.Mappings {
+		if err := startPublicListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
+			stream, err := holder.OpenStream(reqCtx)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := io.WriteString(stream, target+"\n"); err != nil {
+				_ = stream.Close()
+				return nil, err
+			}
+			return stream, nil
+		}); err != nil {
+			return err
+		}
+		if opts.AcceptUDP {
+			if err := startPublicUDPListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
+				stream, err := holder.OpenStream(reqCtx)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := io.WriteString(stream, "UDP "+target+"\n"); err != nil {
+					_ = stream.Close()
+					return nil, err
+				}
+				return stream, nil
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+func acceptControl(ctx context.Context, opts ServerOpts, kind transportKind, onConn func(net.Conn), errCh chan<- error) {
+	if kind.ws {
+		err := serveWSControl(ctx, opts, kind, onConn)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			select {
+			case errCh <- err:
+			default:
