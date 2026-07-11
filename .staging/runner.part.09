@@ -1,0 +1,45 @@
+	if s.readBuf.Len() == 0 && s.readClosed {
+		return 0, io.EOF
+	}
+	return s.readBuf.Read(p)
+}
+
+func (s *simpleMuxStream) Write(p []byte) (int, error) {
+	if s.localClosed.Load() || s.sess.IsClosed() {
+		return 0, io.EOF
+	}
+	const maxChunk = 32 * 1024
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > maxChunk {
+			chunk = p[:maxChunk]
+		}
+		if err := s.sess.writeFrame(frameData, s.id, chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		p = p[len(chunk):]
+	}
+	return written, nil
+}
+
+func (s *simpleMuxStream) Close() error {
+	if s.localClosed.Swap(true) {
+		return nil
+	}
+	s.sess.removeStream(s.id)
+	_ = s.sess.writeFrame(frameClose, s.id, nil)
+	s.remoteClose()
+	return nil
+}
+
+func (s *simpleMuxStream) LocalAddr() net.Addr  { return s.sess.conn.LocalAddr() }
+func (s *simpleMuxStream) RemoteAddr() net.Addr { return s.sess.conn.RemoteAddr() }
+func (s *simpleMuxStream) SetDeadline(t time.Time) error {
+	s.deadlineRead.Store(t)
+	s.deadlineWri.Store(t)
+	return nil
+}
+func (s *simpleMuxStream) SetReadDeadline(t time.Time) error  { s.deadlineRead.Store(t); return nil }
+func (s *simpleMuxStream) SetWriteDeadline(t time.Time) error { s.deadlineWri.Store(t); return nil }
