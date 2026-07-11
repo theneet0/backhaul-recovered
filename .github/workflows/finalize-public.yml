@@ -72,7 +72,15 @@ jobs:
           9c9aa7c91da8de408690b9f1874a687e459e7d3b23fbdacbb9e95bb3ec70b3db  ./tools/interop_original_tcp.py
           EOF_SHA256
           sed -i 's/^          //' /tmp/SOURCE_SHA256
-          sha256sum --check /tmp/SOURCE_SHA256
+          if ! sha256sum --check /tmp/SOURCE_SHA256 > /tmp/source-check.log 2>&1; then
+            cat /tmp/source-check.log
+            {
+              echo 'CHECKSUM_REPORT<<EOF_CHECK'
+              cat /tmp/source-check.log
+              echo 'EOF_CHECK'
+            } >> "$GITHUB_ENV"
+            exit 1
+          fi
 
       - name: Run complete validation
         shell: bash
@@ -157,4 +165,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "PUBLIC_RELEASE_FAILED run=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "PUBLIC_RELEASE_FAILED run=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo '```text'
+            printf '%s\n' "${CHECKSUM_REPORT:-No checksum report; inspect the workflow run.}"
+            echo '```'
+          } > /tmp/public-release-failure.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/public-release-failure.md
