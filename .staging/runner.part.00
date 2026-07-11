@@ -148,7 +148,7 @@ func runWorkerServer(ctx context.Context, opts ServerOpts, kind transportKind) e
 		if opts.AcceptUDP {
 			if err := startPublicUDPListener(ctx, m, opts.Logger, func(reqCtx context.Context, target string) (net.Conn, error) {
 				for {
-n					var worker net.Conn
+					var worker net.Conn
 					select {
 					case worker = <-workerPool:
 					case <-reqCtx.Done():
