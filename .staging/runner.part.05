@@ -1,0 +1,293 @@
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	return c.parent.pc.WriteToUDP(p, c.remote)
+}
+
+func (c *udpControlConn) closeLocal() error {
+	c.closeW.Do(func() {
+		close(c.closed)
+		c.parent.remove(c.key)
+	})
+	return nil
+}
+
+func (c *udpControlConn) Close() error { return c.closeLocal() }
+func (c *udpControlConn) LocalAddr() net.Addr {
+	return c.parent.pc.LocalAddr()
+}
+func (c *udpControlConn) RemoteAddr() net.Addr { return c.remote }
+func (c *udpControlConn) SetDeadline(_ time.Time) error {
+	return nil
+}
+func (c *udpControlConn) SetReadDeadline(_ time.Time) error {
+	return nil
+}
+func (c *udpControlConn) SetWriteDeadline(_ time.Time) error {
+	return nil
+}
+
+func startPublicListener(ctx context.Context, m PortMapping, lg *log.Logger, acquire func(context.Context, string) (net.Conn, error)) error {
+	ln, err := net.Listen("tcp", m.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", m.ListenAddr, err)
+	}
+	lg.Printf("public listener %s -> %s", m.ListenAddr, m.TargetAddr)
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	go func() {
+		for {
+			in, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reqCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+				defer cancel()
+				backend, err := acquire(reqCtx, m.TargetAddr)
+				if err != nil {
+					return
+				}
+				defer backend.Close()
+				bridge(c, backend)
+			}(in)
+		}
+	}()
+	return nil
+}
+
+type udpAssociation struct {
+	conn net.Conn
+	addr *net.UDPAddr
+	mu   sync.Mutex
+}
+
+func startPublicUDPListener(ctx context.Context, m PortMapping, lg *log.Logger, acquire func(context.Context, string) (net.Conn, error)) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", m.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("resolve udp %s: %w", m.ListenAddr, err)
+	}
+	ln, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("listen udp %s: %w", m.ListenAddr, err)
+	}
+	lg.Printf("public udp listener %s -> %s", m.ListenAddr, m.TargetAddr)
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	var assocMu sync.Mutex
+	assocs := map[string]*udpAssociation{}
+	buf := make([]byte, 64*1024)
+	for {
+		n, src, err := ln.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("udp read error on %s: %w", m.ListenAddr, err)
+		}
+		key := src.String()
+		assocMu.Lock()
+		assoc := assocs[key]
+		assocMu.Unlock()
+		if assoc == nil {
+			reqCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			c, err := acquire(reqCtx, m.TargetAddr)
+			cancel()
+			if err != nil {
+				continue
+			}
+			assoc = &udpAssociation{conn: c, addr: src}
+			assocMu.Lock()
+			assocs[key] = assoc
+			assocMu.Unlock()
+
+			go func(k string, a *udpAssociation) {
+				defer func() {
+					_ = a.conn.Close()
+					assocMu.Lock()
+					delete(assocs, k)
+					assocMu.Unlock()
+				}()
+				for {
+					pkt, err := readDatagramFrame(a.conn)
+					if err != nil {
+						return
+					}
+					_, _ = ln.WriteToUDP(pkt, a.addr)
+				}
+			}(key, assoc)
+		}
+		assoc.mu.Lock()
+		err = writeDatagramFrame(assoc.conn, buf[:n])
+		assoc.mu.Unlock()
+		if err != nil {
+			_ = assoc.conn.Close()
+		}
+	}
+}
+
+func bridge(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		_ = a.SetReadDeadline(time.Now())
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		_ = b.SetReadDeadline(time.Now())
+	}()
+	wg.Wait()
+}
+
+func handleUDPClientRelay(control net.Conn, target string) error {
+	up, err := net.Dial("udp", target)
+	if err != nil {
+		return err
+	}
+	defer up.Close()
+	errCh := make(chan error, 2)
+	go func() {
+		for {
+			pkt, err := readDatagramFrame(control)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if _, err := up.Write(pkt); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := up.Read(buf)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := writeDatagramFrame(control, buf[:n]); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	return <-errCh
+}
+
+func writeDatagramFrame(w io.Writer, p []byte) error {
+	if len(p) > 65535 {
+		p = p[:65535]
+	}
+	hdr := []byte{0, 0}
+	binary.BigEndian.PutUint16(hdr, uint16(len(p)))
+	if _, err := w.Write(hdr); err != nil {
+		return err
+	}
+	_, err := w.Write(p)
+	return err
+}
+
+func readDatagramFrame(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr))
+	if n == 0 {
+		return []byte{}, nil
+	}
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
+
+type prefixedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (p prefixedConn) Read(b []byte) (int, error) { return p.r.Read(b) }
+
+func applyTCPOptions(conn net.Conn, nodelay bool, keepalive time.Duration) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		if tc, ok := conn.(*tls.Conn); ok {
+			_ = tc
+		}
+		return
+	}
+	_ = tcp.SetNoDelay(nodelay)
+	if keepalive > 0 {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(keepalive)
+	}
+}
+
+func parseTransport(t string) (transportKind, error) {
+	t = strings.ToLower(strings.TrimSpace(t))
+	if t == "" {
+		t = "tcp"
+	}
+	var k transportKind
+	switch t {
+	case "tcp", "raw", "reverse", "reverseraw", "unix", "tun":
+	case "tls", "anytls":
+		k.tls = true
+	case "ws":
+		k.ws = true
+	case "wsmux":
+		k.ws, k.mux = true, true
+	case "wss":
+		k.ws, k.tls = true, true
+	case "wssmux":
+		k.ws, k.tls, k.mux = true, true, true
+	case "http":
+		k.http = true
+	case "httpmux", "xhttpmux":
+		k.http, k.mux = true, true
+	case "https":
+		k.http, k.tls = true, true
+	case "httpsmux", "xhttpsmux":
+		k.http, k.tls, k.mux = true, true, true
+	case "grpc":
+		k.grpc = true
+	case "grpcmux", "xgrpcmux":
+		k.grpc, k.mux = true, true
+	case "grpcs":
+		k.grpc, k.tls = true, true
+	case "grpcsmux", "xgrpcsmux":
+		k.grpc, k.tls, k.mux = true, true, true
+	case "kcp", "kuic":
+		k.kcp = true
+	case "kcpmux":
+		k.kcp, k.mux = true, true
+	case "udp":
+		k.udp = true
+	case "udpmux":
+		k.udp, k.mux = true, true
+	case "dns":
+		k.udp, k.dns = true, true
+	case "dnsmux":
+		k.udp, k.dns, k.mux = true, true, true
+	case "tcpmux", "xtcpmux", "slipstream", "sstream", "slipstreamtcp":
+		k.mux = true
+	case "slipstreammux", "slipstreamkcp", "sstreamkcp", "sstreammux":
+		k.mux, k.slip, k.kcp = true, true, true
+	default:
+		return transportKind{}, fmt.Errorf("unsupported transport: %s", t)
+	}
+	return k, nil
+}
