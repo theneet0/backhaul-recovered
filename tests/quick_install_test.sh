@@ -10,7 +10,11 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  rm -rf "$RELEASE_DIR" "$INSTALL_ROOT"
+  if command -v sudo >/dev/null 2>&1; then
+    sudo rm -rf "$RELEASE_DIR" "$INSTALL_ROOT"
+  else
+    rm -rf "$RELEASE_DIR" "$INSTALL_ROOT"
+  fi
 }
 trap cleanup EXIT
 
