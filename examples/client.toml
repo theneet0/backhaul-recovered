@@ -1,0 +1,21 @@
+# Client: connects to the public server and reaches the local service.
+[dialer]
+remote_addr = "SERVER_IP:3080"
+dial_timeout = 10
+retry_interval = 3
+
+[transport]
+type = "tcp"
+connection_pool = 8
+nodelay = true
+keepalive_period = 40
+heartbeat_interval = 10
+heartbeat_timeout = 25
+
+[security]
+# Must match the server token.
+token = "replace-with-a-long-random-token"
+
+[logging]
+log_level = "info"
+
